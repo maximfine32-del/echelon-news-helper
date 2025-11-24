@@ -2,14 +2,19 @@
 import os
 import logging
 import asyncio
+import threading
+import concurrent.futures
 from telegram import Update, Bot
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    ContextTypes, filters, ConversationHandler
+    Application,
+    CommandHandler,
+    ConversationHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
 )
 import requests
 from flask import Flask, request, jsonify
-import threading
 
 # === Логирование ===
 logging.basicConfig(
@@ -23,6 +28,8 @@ TITLE, EXCERPT, CONTENT, PHOTO = range(4)
 
 # === Глобальные переменные ===
 telegram_app = None
+telegram_loop: asyncio.AbstractEventLoop | None = None
+telegram_ready = threading.Event()
 _app_lock = threading.Lock()
 
 # === Функции WordPress ===
@@ -116,36 +123,74 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # === Инициализация Telegram-приложения ===
+def _build_conversation_handler() -> ConversationHandler:
+    return ConversationHandler(
+        entry_points=[CommandHandler('start', start)],
+        states={
+            TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, title)],
+            EXCERPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, excerpt)],
+            CONTENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, content)],
+            PHOTO: [MessageHandler(filters.PHOTO, photo)]
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    )
+
+
+def _application_thread() -> None:
+    """
+    Создаёт приложение Telegram в отдельном event loop и держит его активным.
+    Flask-запросы затем прокидывают апдейты в этот loop через run_coroutine_threadsafe.
+    """
+    global telegram_app, telegram_loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise ValueError("TELEGRAM_BOT_TOKEN не задан")
+
+    application = Application.builder().token(token).build()
+    application.add_handler(_build_conversation_handler())
+
+    async def _startup():
+        await application.initialize()
+        await application.start()
+
+    loop.run_until_complete(_startup())
+    telegram_app = application
+    telegram_loop = loop
+    telegram_ready.set()
+
+    try:
+        loop.run_forever()
+    finally:
+        async def _shutdown():
+            await application.stop()
+            await application.shutdown()
+        loop.run_until_complete(_shutdown())
+        loop.close()
+
+
 def get_telegram_app():
-    global telegram_app
     if telegram_app is None:
         with _app_lock:
             if telegram_app is None:
-                token = os.getenv("TELEGRAM_BOT_TOKEN")
-                if not token:
-                    raise ValueError("TELEGRAM_BOT_TOKEN не задан")
-                telegram_app = Application.builder().token(token).build()
-                conv_handler = ConversationHandler(
-                    entry_points=[CommandHandler('start', start)],
-                    states={
-                        TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, title)],
-                        EXCERPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, excerpt)],
-                        CONTENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, content)],
-                        PHOTO: [MessageHandler(filters.PHOTO, photo)]
-                    },
-                    fallbacks=[CommandHandler('cancel', cancel)]
-                )
-                telegram_app.add_handler(conv_handler)
-                # Инициализация в фоновом потоке с event loop
-                def init_in_thread():
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    loop.run_until_complete(telegram_app.initialize())
-                    loop.close()
-                thread = threading.Thread(target=init_in_thread, daemon=True)
+                thread = threading.Thread(target=_application_thread, daemon=True)
                 thread.start()
-                thread.join(timeout=5)  # Ждём инициализацию
+        if not telegram_ready.wait(timeout=10):
+            raise RuntimeError("Не удалось инициализировать Telegram application.")
     return telegram_app
+
+
+def _process_update(update: Update) -> None:
+    app_instance = get_telegram_app()
+    if telegram_loop is None:
+        raise RuntimeError("Event loop Telegram приложения ещё не готов.")
+    future = asyncio.run_coroutine_threadsafe(app_instance.process_update(update), telegram_loop)
+    try:
+        future.result(timeout=30)
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        raise TimeoutError("Превышено время обработки апдейта Telegram.")
 
 # === Flask-приложение ===
 app = Flask(__name__)
@@ -161,7 +206,7 @@ def webhook(token):
     try:
         app_instance = get_telegram_app()
         update = Update.de_json(request.get_json(force=True), app_instance.bot)
-        asyncio.run(app_instance.process_update(update))
+        _process_update(update)
         return "OK", 200
     except Exception as e:
         logger.error(f"Webhook error: {e}")
@@ -172,7 +217,10 @@ def set_webhook_if_needed():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     render_url = os.getenv("RENDER_EXTERNAL_URL")
     if token and render_url:
-        webhook_url = f"https://{render_url}/webhook/{token}"
+        clean_base = render_url.rstrip("/")
+        if not clean_base.startswith("http://") and not clean_base.startswith("https://"):
+            clean_base = f"https://{clean_base}"
+        webhook_url = f"{clean_base}/webhook/{token}"
         bot = Bot(token=token)
         try:
             asyncio.run(bot.set_webhook(url=webhook_url))
