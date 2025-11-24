@@ -1,82 +1,57 @@
-# Echelon News Helper Bot
+# 📰 Telegram-бот для публикации новостей в WordPress
 
-Telegram-бот, который помогает подготовить и мгновенно опубликовать новость сразу на нескольких площадках: трёх сайтах на WordPress (рубрика «Новости») и в Telegram‑канале.
+Этот бот принимает от вас в Telegram:
+- Заголовок новости  
+- Анонс (краткое описание)  
+- Полный текст  
+- Изображение  
 
-## Возможности
+…и автоматически публикует запись **на трёх ваших WordPress-сайтах**.
 
-- Последовательный сбор заголовка, отрывка, полного текста и изображения.
-- Выбор одной или нескольких площадок для публикации (WordPress сайты и/или канал).
-- Публикация в WordPress через REST API (создание записи и загрузка изображения как `featured_media`).
-- Публикация в канал Telegram с изображением и отдельным текстовым сообщением.
-- Ограничение доступа по whitelisting (опционально).
+Проект разработан для размещения на **Render.com** с использованием **Docker** и **webhook-режима**.
 
-## Настройка окружения
+---
 
-Создайте файл `.env` (или задайте переменные среды любым удобным способом):
+## 🧩 Возможности
 
-```bash
-TELEGRAM_BOT_TOKEN=123456:AA...
-TELEGRAM_TARGET_CHANNEL_ID=@your_channel
-WP_SITES_CONFIG=[
-  {
-    "slug": "site1",
-    "name": "АО Эшелон Технологии",
-    "base_url": "https://example.com",
-    "username": "m.belonogii",
-    "application_password": "kQgkcD@HZ$T$QLZ87R5N4i)V",
-    "news_category_id": 12
-  },
-  {
-    "slug": "site2",
-    "name": "Сайт №2",
-    "base_url": "https://example.net",
-    "username": "bot-user",
-    "application_password": "....",
-    "news_category_id": 34
-  }
-]
-# необязательно, но можно ограничить доступ
-ALLOWED_CHAT_IDS=123456789,987654321
-```
+- Публикация на нескольких WordPress-сайтах одновременно  
+- Поддержка изображений (становятся featured image)  
+- Защита по Telegram ID (только вы можете использовать бота)  
+- Минималистичный и надёжный код на Python  
+- Готов к деплою на Render (бесплатный тариф)
 
-> **Как получить `news_category_id`?** В админке WordPress зайдите в «Рубрики», наведите на «Новости» и скопируйте `tag_ID` из ссылки.
+---
 
-## Локальный запуск
+## 🛠 Требования
 
-```bash
-python -m venv .venv
-. .venv/Scripts/activate  # Windows
-pip install -r requirements.txt
-python -m src.bot
-```
+- Аккаунт Telegram и бот (токен от [@BotFather](https://t.me/BotFather))  
+- Три WordPress-сайта с включённым REST API  
+- Учётные данные с **Application Passwords** для каждого сайта  
+- Аккаунт на [Render.com](https://render.com)  
 
-Бот запустится и начнёт polling Telegram API. Введите `/start`, чтобы пройти сценарий публикации.
+> ⚠️ Убедитесь, что на ваших WordPress-сайтах **работает**:  
+> `https://ваш-сайт.ru/wp-json/wp/v2/posts`
 
-## Docker
+---
 
-```bash
-docker build -t echelon-news-helper .
-docker run --rm -it --env-file .env echelon-news-helper
-```
+## ⚙️ Настройка
 
-Контейнер использует `python:3.11-slim`, поэтому его легко развернуть на любой платформе.
+### 1. Переменные окружения
 
-## Развёртывание на Render
+Создайте файл `.env` (не коммитьте его!):
 
-1. Создайте **Docker**-службу на [Render](https://render.com/).
-2. Укажите репозиторий GitHub, выберите регион и тариф, задайте необходимые переменные окружения.
-3. Настройте Health Check (необязательно) и задействуйте авто-деплой при пуше в ветку.
-4. Render автоматически построит образ и запустит контейнер (zero-downtime деплой, автоскейлинг и приватная сеть доступны из коробки). [Источник](https://render.com/)
+```env
+TELEGRAM_BOT_TOKEN=123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ
+ALLOWED_USER_ID=123456789
 
-## Архитектура кода
+WP_SITE_1_URL=https://site1.ru
+WP_SITE_1_USER=bot_user
+WP_SITE_1_PASS=abcd efgh ijkl mnop qrst uvwx
 
-- `src/config.py` — парсинг конфигурации из переменных окружения.
-- `src/wordpress_client.py` — минимальный клиент для загрузки медиа и создания постов.
-- `src/bot.py` — сценарий Telegram-бота (ConversationHandler) и сервис публикации.
+WP_SITE_2_URL=https://site2.ru
+WP_SITE_2_USER=bot_user
+WP_SITE_2_PASS=...
 
-## Дальнейшие улучшения
-
-- Автогенерация предпросмотра (например, Markdown → HTML).
-- Поддержка отложенных публикаций и драфтов.
-- Хранение истории публикаций в базе данных.
-
+WP_SITE_3_URL=https://site3.ru
+WP_SITE_3_USER=bot_user
+WP_SITE_3_PASS=...
