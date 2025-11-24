@@ -20,10 +20,10 @@ TELEGRAM_TARGET_CHANNEL_ID=@your_channel
 WP_SITES_CONFIG=[
   {
     "slug": "site1",
-    "name": "Сайт №1",
+    "name": "АО Эшелон Технологии",
     "base_url": "https://example.com",
-    "username": "bot-user",
-    "application_password": "xxxx xxxx xxxx xxxx xxxx xxxx",
+    "username": "m.belonogii",
+    "application_password": "kQgkcD@HZ$T$QLZ87R5N4i)V",
     "news_category_id": 12
   },
   {
