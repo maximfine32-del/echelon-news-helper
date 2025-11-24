@@ -26,7 +26,10 @@ from telegram.ext import (
 from .config import AppConfig, WordPressSiteConfig, get_cached_config
 from .wordpress_client import WordPressClient
 
-logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s [%(funcName)s]: %(message)s",
+    level=logging.INFO,
+)
 logger = logging.getLogger(__name__)
 
 
@@ -78,6 +81,7 @@ class PublisherService:
         results: List[PublicationResult] = []
         for target_id in target_ids:
             target = self.targets[target_id]
+            logger.info("Начинаю публикацию на %s (%s)", target.label, target.kind.value)
             if target.kind is TargetKind.WORDPRESS and target.site_slug:
                 results.append(await self._publish_wordpress(target, draft))
             elif target.kind is TargetKind.TELEGRAM:
@@ -95,25 +99,38 @@ class PublisherService:
     async def _publish_wordpress(self, target: PublicationTarget, draft: NewsDraft) -> PublicationResult:
         site_config = self.config.sites_by_slug[target.site_slug]  # type: ignore[index]
         try:
+            logger.info(
+                "WordPress публикация: slug=%s title=%s category=%s",
+                site_config.slug,
+                draft.title,
+                site_config.news_category_id,
+            )
             async with WordPressClient(site_config) as client:
                 media_id = await client.upload_media(draft.image_filename, draft.image_bytes)
+                logger.info("Изображение загружено, media_id=%s", media_id)
                 post = await client.create_post(
                     title=draft.title,
                     excerpt=draft.excerpt,
                     content=draft.content,
                     featured_media=media_id,
                 )
+            logger.info("WordPress пост создан: %s", post.get("link"))
             return PublicationResult(
                 target_label=target.label,
                 success=True,
                 detail=f"Опубликовано: {post.get('link', 'без ссылки')}",
             )
         except Exception as exc:  # noqa: BLE001
-            logger.exception("WordPress publish failed for %s", target.label)
+            logger.exception("WordPress publish failed for %s: %s", target.label, exc)
             return PublicationResult(target_label=target.label, success=False, detail=str(exc))
 
     async def _publish_telegram(self, target: PublicationTarget, draft: NewsDraft, bot) -> PublicationResult:
         try:
+            logger.info(
+                "Отправляю новость в Telegram канал %s. Заголовок: %s",
+                self.config.telegram_channel.channel_id,
+                draft.title,
+            )
             caption = f"<b>{draft.title}</b>\n\n{draft.excerpt}"
             await bot.send_photo(
                 chat_id=self.config.telegram_channel.channel_id,
@@ -126,13 +143,14 @@ class PublisherService:
                     chat_id=self.config.telegram_channel.channel_id,
                     text=draft.content,
                 )
+            logger.info("Telegram публикация завершена успешно.")
             return PublicationResult(
                 target_label=target.label,
                 success=True,
                 detail="Новость отправлена в канал.",
             )
         except Exception as exc:  # noqa: BLE001
-            logger.exception("Telegram publish failed")
+            logger.exception("Telegram publish failed: %s", exc)
             return PublicationResult(target_label=target.label, success=False, detail=str(exc))
 
 
@@ -267,6 +285,8 @@ async def publish_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer("Выберите хотя бы одну площадку.", show_alert=True)
         return FormState.TARGETS
 
+    logger.info("Публикация запущена пользователем %s. targets=%s", query.from_user.id, selected)
+
     await query.answer("Публикую...")
     await query.edit_message_text("Публикуем новость, подождите...")
 
@@ -280,6 +300,7 @@ async def publish_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     publisher: PublisherService = context.application.bot_data["publisher"]
     results = await publisher.publish(draft, list(selected), context.bot)
+    logger.info("Публикация завершена. Results=%s", results)
 
     lines = ["Результаты публикации:"]
     for result in results:
