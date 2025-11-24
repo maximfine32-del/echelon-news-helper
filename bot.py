@@ -1,6 +1,7 @@
 # bot.py
 import os
 import logging
+import threading
 from telegram import Update, Bot
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -18,6 +19,11 @@ logger = logging.getLogger(__name__)
 
 # === Константы состояний ===
 TITLE, EXCERPT, CONTENT, PHOTO = range(4)
+
+# === Глобальные переменные для инициализации ===
+telegram_app = None
+_webhook_initialized = False
+_init_lock = threading.Lock()
 
 # === Функция публикации на WordPress ===
 def publish_to_wordpress(title, excerpt, content, photo_file, sites):
@@ -123,29 +129,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🚫 Публикация отменена.")
     return ConversationHandler.END
 
-# === Flask-приложение ===
-app = Flask(__name__)
-
-# Глобальное Telegram-приложение
-telegram_app = None
-
-def set_webhook():
-    """Устанавливает webhook в Telegram один раз при старте."""
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    render_url = os.getenv("RENDER_EXTERNAL_URL")
-    if not token or not render_url:
-        logger.warning("TELEGRAM_BOT_TOKEN или RENDER_EXTERNAL_URL не заданы. Webhook не установлен.")
-        return
-
-    webhook_url = f"https://{render_url}/webhook/{token}"
-    bot = Bot(token=token)
-    try:
-        bot.set_webhook(url=webhook_url)
-        logger.info(f"Webhook успешно установлен: {webhook_url}")
-    except Exception as e:
-        logger.error(f"Не удалось установить webhook: {e}")
-
-@app.before_first_request
+# === Инициализация Telegram-приложения и webhook ===
 def init_telegram_app():
     global telegram_app
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -165,12 +149,35 @@ def init_telegram_app():
         fallbacks=[CommandHandler('cancel', cancel)]
     )
     telegram_app.add_handler(conv_handler)
-
-    # Инициализируем приложение (без запуска!)
     telegram_app.initialize()
 
-    # Устанавливаем webhook
-    set_webhook()
+def set_webhook():
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    render_url = os.getenv("RENDER_EXTERNAL_URL")
+    if not token or not render_url:
+        logger.warning("TELEGRAM_BOT_TOKEN или RENDER_EXTERNAL_URL не заданы. Webhook не установлен.")
+        return
+
+    webhook_url = f"https://{render_url}/webhook/{token}"
+    bot = Bot(token=token)
+    try:
+        bot.set_webhook(url=webhook_url)
+        logger.info(f"Webhook успешно установлен: {webhook_url}")
+    except Exception as e:
+        logger.error(f"Не удалось установить webhook: {e}")
+
+# === Flask-приложение ===
+app = Flask(__name__)
+
+@app.before_request
+def initialize_webhook_once():
+    global _webhook_initialized
+    if not _webhook_initialized:
+        with _init_lock:
+            if not _webhook_initialized:
+                init_telegram_app()
+                set_webhook()
+                _webhook_initialized = True
 
 @app.route("/webhook/<token>", methods=["POST"])
 def telegram_webhook(token):
