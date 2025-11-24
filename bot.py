@@ -1,7 +1,7 @@
 # bot.py
 import os
 import logging
-from telegram import Update
+from telegram import Update, Bot
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     ContextTypes, filters, ConversationHandler
@@ -38,7 +38,6 @@ def publish_to_wordpress(title, excerpt, content, photo_file, sites):
                 results.append(f"❌ Ошибка загрузки фото на {site['url']}: {media_res.status_code}")
                 continue
             media_id = media_res.json().get('id')
-            media_link = media_res.json().get('link', '')
 
             # 2. Публикуем запись
             post_data = {
@@ -130,6 +129,22 @@ app = Flask(__name__)
 # Глобальное Telegram-приложение
 telegram_app = None
 
+def set_webhook():
+    """Устанавливает webhook в Telegram один раз при старте."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    render_url = os.getenv("RENDER_EXTERNAL_URL")
+    if not token or not render_url:
+        logger.warning("TELEGRAM_BOT_TOKEN или RENDER_EXTERNAL_URL не заданы. Webhook не установлен.")
+        return
+
+    webhook_url = f"https://{render_url}/webhook/{token}"
+    bot = Bot(token=token)
+    try:
+        bot.set_webhook(url=webhook_url)
+        logger.info(f"Webhook успешно установлен: {webhook_url}")
+    except Exception as e:
+        logger.error(f"Не удалось установить webhook: {e}")
+
 @app.before_first_request
 def init_telegram_app():
     global telegram_app
@@ -151,21 +166,20 @@ def init_telegram_app():
     )
     telegram_app.add_handler(conv_handler)
 
-    # Устанавливаем webhook
-    webhook_url = f"https://{os.getenv('RENDER_EXTERNAL_URL')}/webhook/{token}"
-    telegram_app.run_webhook(
-        listen="0.0.0.0",
-        port=int(os.getenv("PORT", 10000)),
-        webhook_url=webhook_url,
-        secret_token=None  # или задайте, если нужно
-    )
+    # Инициализируем приложение (без запуска!)
+    telegram_app.initialize()
 
-@app.route(f"/webhook/<token>", methods=["POST"])
+    # Устанавливаем webhook
+    set_webhook()
+
+@app.route("/webhook/<token>", methods=["POST"])
 def telegram_webhook(token):
     if token != os.getenv("TELEGRAM_BOT_TOKEN"):
         return "Forbidden", 403
+    if telegram_app is None:
+        return "Application not ready", 503
     update = Update.de_json(request.get_json(force=True), telegram_app.bot)
-    telegram_app.update_queue.put(update)
+    telegram_app.update_queue.put_nowait(update)
     return "OK", 200
 
 @app.route("/health")
