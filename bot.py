@@ -232,10 +232,18 @@ async def publish_to_telegram_channel(draft: NewsDraft, bot: Bot) -> tuple[bool,
 # === Хендлеры Telegram ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    allowed_id = int(os.getenv("ALLOWED_USER_ID_1", "0")) or int(os.getenv("ALLOWED_USER_ID_2", "0")) or int(os.getenv("ALLOWED_USER_ID_3", "0"))
-    if user_id != allowed_id:
+    allowed_ids_str = os.getenv("ALLOWED_USER_IDS", "")
+    
+    # Преобразуем строку в список целых чисел
+    try:
+        allowed_ids = [int(x.strip()) for x in allowed_ids_str.split(",") if x.strip()]
+    except ValueError:
+        allowed_ids = []
+
+    if user_id not in allowed_ids:
         await update.message.reply_text("❌ У вас нет доступа к этому боту.")
         return ConversationHandler.END
+
     await update.message.reply_text("📰 Отправьте заголовок новости:")
     return TITLE
 
