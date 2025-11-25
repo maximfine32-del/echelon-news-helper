@@ -37,6 +37,13 @@ TITLE, EXCERPT, CONTENT, SCHEDULE, PHOTO, TARGETS = range(6)
 
 
 # === Конфигурация публикаций ===
+TARGET_LABEL_OVERRIDES = {
+    "wp:site1": 'Cайт АО "Эшелон Технологии"',
+    "wp:site2": 'Сайт АО "НПО "Эшелон"',
+    "telegram:channel": 'Telegram-канал "Echelon Eyes"',
+}
+
+
 @dataclass(frozen=True)
 class WordPressSite:
     slug: str
@@ -99,10 +106,11 @@ def load_wordpress_sites() -> List[WordPressSite]:
 def build_targets(sites: List[WordPressSite], telegram_channel: str | None) -> List[PublicationTarget]:
     targets: List[PublicationTarget] = []
     for site in sites:
+        target_id = f"wp:{site.slug}"
         targets.append(
             PublicationTarget(
-                target_id=f"wp:{site.slug}",
-                label=f"WordPress · {site.name}",
+                target_id=target_id,
+                label=TARGET_LABEL_OVERRIDES.get(target_id, f"WordPress · {site.name}"),
                 kind=TargetKind.WORDPRESS,
                 site=site,
             )
@@ -111,7 +119,7 @@ def build_targets(sites: List[WordPressSite], telegram_channel: str | None) -> L
         targets.append(
             PublicationTarget(
                 target_id="telegram:channel",
-                label="Telegram-канал",
+                label=TARGET_LABEL_OVERRIDES.get("telegram:channel", "Telegram-канал"),
                 kind=TargetKind.TELEGRAM,
             )
         )
@@ -224,7 +232,7 @@ async def publish_to_telegram_channel(draft: NewsDraft, bot: Bot) -> tuple[bool,
 # === Хендлеры Telegram ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    allowed_id = int(os.getenv("ALLOWED_USER_ID", "0"))
+    allowed_id = int(os.getenv("ALLOWED_USER_ID_1", "0")) or int(os.getenv("ALLOWED_USER_ID_2", "0")) or int(os.getenv("ALLOWED_USER_ID_3", "0"))
     if user_id != allowed_id:
         await update.message.reply_text("❌ У вас нет доступа к этому боту.")
         return ConversationHandler.END
@@ -244,7 +252,7 @@ async def excerpt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def content(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['content'] = update.message.text
     await update.message.reply_text(
-        "🗓 Укажите дату публикации для WordPress сайтов в формате YYYY-MM-DD HH:MM или напишите «сейчас»."
+        "🗓 Укажите дату публикации для WordPress сайтов в формате HH:MM MM.DD.YYYY или напишите «сейчас»."
     )
     return SCHEDULE
 
@@ -255,10 +263,10 @@ async def schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['publish_at'] = None
     else:
         try:
-            publish_at = datetime.strptime(text, "%Y-%m-%d %H:%M")
+            publish_at = datetime.strptime(text, "%H:%M %m.%d.%Y")
             context.user_data['publish_at'] = publish_at
         except ValueError:
-            await update.message.reply_text("Не получилось распознать дату. Используйте формат YYYY-MM-DD HH:MM.")
+            await update.message.reply_text("Не получилось распознать дату. Используйте формат HH:MM MM.DD.YYYY.")
             return SCHEDULE
     await update.message.reply_text("🖼 Отправьте изображение (как фото, не как файл!):")
     return PHOTO
