@@ -4,11 +4,15 @@ import logging
 import asyncio
 import threading
 import concurrent.futures
+import re
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum, auto
+from html import unescape
 from typing import List, Dict, Set
 
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -29,7 +33,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # === Состояния диалога ===
-TITLE, EXCERPT, CONTENT, PHOTO, TARGETS = range(5)
+TITLE, EXCERPT, CONTENT, SCHEDULE, PHOTO, TARGETS = range(6)
 
 
 # === Конфигурация публикаций ===
@@ -61,6 +65,7 @@ class NewsDraft:
     excerpt: str
     content: str
     photo_bytes: bytes
+    publish_at: datetime | None
 
 
 def load_wordpress_sites() -> List[WordPressSite]:
@@ -121,6 +126,41 @@ PUBLICATION_TARGETS = build_targets(WORDPRESS_SITES, TELEGRAM_CHANNEL_ID)
 TARGETS_BY_ID: Dict[str, PublicationTarget] = {target.target_id: target for target in PUBLICATION_TARGETS}
 
 
+def html_to_telegram(html_text: str) -> str:
+    if not html_text:
+        return ""
+    text = html_text.replace("<strong>", "<b>").replace("</strong>", "</b>")
+    text = text.replace("<em>", "<i>").replace("</em>", "</i>")
+    text = re.sub(r"<\s*br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<\s*/p\s*>", "\n\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<\s*p[^>]*>", "", text, flags=re.IGNORECASE)
+
+    def replace_li(match: re.Match[str]) -> str:
+        inner = match.group(1).strip()
+        return f"• {inner}\n"
+
+    text = re.sub(r"<li[^>]*>(.*?)</li>", replace_li, text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"</?(ul|ol)[^>]*>", "", text, flags=re.IGNORECASE)
+    allowed = {"b", "i", "u", "a", "code", "pre"}
+
+    def strip_tag(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        name = match.group(1).lower()
+        if name in allowed:
+            return raw
+        if name.startswith("/"):
+            name = name[1:]
+            if name in allowed:
+                return raw
+        return ""
+
+    text = re.sub(r"</?([a-zA-Z0-9]+)[^>]*>", strip_tag, text)
+    text = unescape(text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    return text.strip()
+
+
 # === Глобальные переменные ===
 telegram_app = None
 telegram_loop: asyncio.AbstractEventLoop | None = None
@@ -144,6 +184,8 @@ def publish_to_wordpress_site(site: WordPressSite, draft: NewsDraft) -> tuple[bo
             "featured_media": media_id,
             "categories": [site.category_id],
         }
+        if draft.publish_at:
+            post_payload["date"] = draft.publish_at.strftime("%Y-%m-%dT%H:%M:%S")
         posts_url = f"{site.url}/wp-json/wp/v2/posts"
         post_res = requests.post(posts_url, auth=site.auth, json=post_payload, timeout=30)
         if post_res.status_code == 201:
@@ -158,16 +200,22 @@ def publish_to_wordpress_site(site: WordPressSite, draft: NewsDraft) -> tuple[bo
 async def publish_to_telegram_channel(draft: NewsDraft, bot: Bot) -> tuple[bool, str]:
     if not TELEGRAM_CHANNEL_ID:
         return False, "Телеграм-канал не настроен."
-    caption = f"<b>{draft.title}</b>\n\n{draft.excerpt}".strip()
+    parts = [f"<b>{draft.title}</b>"]
+    if draft.excerpt.strip():
+        parts.append(draft.excerpt.strip())
+    formatted_content = html_to_telegram(draft.content)
+    if formatted_content:
+        parts.append(formatted_content)
+    caption = "\n\n".join(parts).strip()
+    if len(caption) > 1024:
+        caption = caption[:1019].rstrip() + "…"
     try:
         await bot.send_photo(
             chat_id=TELEGRAM_CHANNEL_ID,
             photo=draft.photo_bytes,
             caption=caption[:1024],
-            parse_mode="HTML",
+            parse_mode=ParseMode.HTML,
         )
-        if draft.content.strip():
-            await bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=draft.content)
         return True, "✅ Telegram: публикация отправлена."
     except Exception as exc:  # noqa: BLE001
         logger.exception("Ошибка публикации в Telegram: %s", exc)
@@ -195,6 +243,23 @@ async def excerpt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def content(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['content'] = update.message.text
+    await update.message.reply_text(
+        "🗓 Укажите дату публикации для WordPress сайтов в формате YYYY-MM-DD HH:MM или напишите «сейчас»."
+    )
+    return SCHEDULE
+
+
+async def schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if not text or text.lower() in {"сейчас", "now"}:
+        context.user_data['publish_at'] = None
+    else:
+        try:
+            publish_at = datetime.strptime(text, "%Y-%m-%d %H:%M")
+            context.user_data['publish_at'] = publish_at
+        except ValueError:
+            await update.message.reply_text("Не получилось распознать дату. Используйте формат YYYY-MM-DD HH:MM.")
+            return SCHEDULE
     await update.message.reply_text("🖼 Отправьте изображение (как фото, не как файл!):")
     return PHOTO
 
@@ -210,6 +275,7 @@ async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         excerpt=context.user_data['excerpt'],
         content=context.user_data['content'],
         photo_bytes=bytes(photo_bytes),
+        publish_at=context.user_data.get('publish_at'),
     )
     context.user_data['selected_targets'] = set()
     await send_target_selection(update, context)
@@ -217,9 +283,10 @@ async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_target_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
     selected: Set[str] = context.user_data.get('selected_targets', set())
     markup = build_targets_markup(selected)
-    await update.message.reply_text(
+    await message.reply_text(
         "Выберите площадки для публикации (можно несколько).",
         reply_markup=markup,
     )
@@ -315,7 +382,8 @@ def _build_conversation_handler() -> ConversationHandler:
             TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, title)],
             EXCERPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, excerpt)],
             CONTENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, content)],
-            PHOTO: [MessageHandler(filters.PHOTO, photo)],
+            SCHEDULE: [MessageHandler(filters.TEXT & ~filters.COMMAND, schedule)],
+            PHOTO: [MessageHandler(filters.PHOTO & ~filters.COMMAND, photo)],
             TARGETS: [
                 CallbackQueryHandler(toggle_target, pattern=r"^toggle:"),
                 CallbackQueryHandler(publish_handler, pattern=r"^publish:go$"),
