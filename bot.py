@@ -260,21 +260,21 @@ async def excerpt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def content(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['content'] = update.message.text
     await update.message.reply_text(
-        "🗓 Укажите дату публикации для WordPress сайтов в формате HH:MM MM.DD.YYYY или напишите «сейчас»."
+        "🗓 Укажите дату публикации для WordPress сайтов в формате HH:MM DD.MM.YYYY или напишите «Сейчас»."
     )
     return SCHEDULE
 
 
 async def schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
-    if not text or text.lower() in {"сейчас", "now"}:
+    if not text or text.lower() in {"сейчас", "now", "Сейчас", "Now"}:
         context.user_data['publish_at'] = None
     else:
         try:
-            publish_at = datetime.strptime(text, "%H:%M %m.%d.%Y")
+            publish_at = datetime.strptime(text, "%H:%M %d.%m.%Y")
             context.user_data['publish_at'] = publish_at
         except ValueError:
-            await update.message.reply_text("Не получилось распознать дату. Используйте формат HH:MM MM.DD.YYYY.")
+            await update.message.reply_text("Не получилось распознать дату. Используйте формат HH:MM DD.MM.YYYY.")
             return SCHEDULE
     await update.message.reply_text("🖼 Отправьте изображение (как фото, не как файл!):")
     return PHOTO
