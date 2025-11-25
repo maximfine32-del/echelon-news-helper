@@ -4,9 +4,14 @@ import logging
 import asyncio
 import threading
 import concurrent.futures
-from telegram import Update, Bot
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import List, Dict, Set
+
+from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ConversationHandler,
     ContextTypes,
@@ -24,7 +29,97 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # === Состояния диалога ===
-TITLE, EXCERPT, CONTENT, PHOTO = range(4)
+TITLE, EXCERPT, CONTENT, PHOTO, TARGETS = range(5)
+
+
+# === Конфигурация публикаций ===
+@dataclass(frozen=True)
+class WordPressSite:
+    slug: str
+    name: str
+    url: str
+    auth: tuple[str, str]
+    category_id: int
+
+
+class TargetKind(Enum):
+    WORDPRESS = auto()
+    TELEGRAM = auto()
+
+
+@dataclass(frozen=True)
+class PublicationTarget:
+    target_id: str
+    label: str
+    kind: TargetKind
+    site: WordPressSite | None = None
+
+
+@dataclass
+class NewsDraft:
+    title: str
+    excerpt: str
+    content: str
+    photo_bytes: bytes
+
+
+def load_wordpress_sites() -> List[WordPressSite]:
+    sites: List[WordPressSite] = []
+    for idx in range(1, 4):
+        url = os.getenv(f"WP_SITE_{idx}_URL")
+        user = os.getenv(f"WP_SITE_{idx}_USER")
+        pwd = os.getenv(f"WP_SITE_{idx}_PASS")
+        category_raw = os.getenv(f"WP_SITE_{idx}_CATEGORY_ID")
+        if not (url and user and pwd and category_raw):
+            continue
+        try:
+            category_id = int(category_raw)
+        except ValueError:
+            logger.warning("WP_SITE_%s_CATEGORY_ID не число, сайт пропущен.", idx)
+            continue
+        name = os.getenv(f"WP_SITE_{idx}_NAME", f"Сайт {idx}")
+        slug = os.getenv(f"WP_SITE_{idx}_SLUG", f"site{idx}")
+        sites.append(
+            WordPressSite(
+                slug=slug,
+                name=name,
+                url=url.rstrip("/"),
+                auth=(user, pwd),
+                category_id=category_id,
+            )
+        )
+    return sites
+
+
+def build_targets(sites: List[WordPressSite], telegram_channel: str | None) -> List[PublicationTarget]:
+    targets: List[PublicationTarget] = []
+    for site in sites:
+        targets.append(
+            PublicationTarget(
+                target_id=f"wp:{site.slug}",
+                label=f"WordPress · {site.name}",
+                kind=TargetKind.WORDPRESS,
+                site=site,
+            )
+        )
+    if telegram_channel:
+        targets.append(
+            PublicationTarget(
+                target_id="telegram:channel",
+                label="Telegram-канал",
+                kind=TargetKind.TELEGRAM,
+            )
+        )
+    if not targets:
+        raise RuntimeError("Не заданы площадки для публикации. Заполните WP_SITE_* и/или TELEGRAM_TARGET_CHANNEL_ID.")
+    return targets
+
+
+WORDPRESS_SITES = load_wordpress_sites()
+TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_TARGET_CHANNEL_ID")
+PUBLICATION_TARGETS = build_targets(WORDPRESS_SITES, TELEGRAM_CHANNEL_ID)
+TARGETS_BY_ID: Dict[str, PublicationTarget] = {target.target_id: target for target in PUBLICATION_TARGETS}
+
 
 # === Глобальные переменные ===
 telegram_app = None
@@ -32,35 +127,51 @@ telegram_loop: asyncio.AbstractEventLoop | None = None
 telegram_ready = threading.Event()
 _app_lock = threading.Lock()
 
-# === Функции WordPress ===
-def publish_to_wordpress(title, excerpt, content, photo_file, sites):
-    results = []
-    for site in sites:
-        try:
-            auth = site['auth']
-            media_url = f"{site['url']}/wp-json/wp/v2/media"
-            files = {'file': ('news.jpg', photo_file, 'image/jpeg')}
-            media_res = requests.post(media_url, auth=auth, files=files)
-            if media_res.status_code != 201:
-                results.append(f"❌ Ошибка загрузки фото на {site['url']}: {media_res.status_code}")
-                continue
-            media_id = media_res.json().get('id')
-            post_data = {
-                'title': title,
-                'excerpt': excerpt,
-                'content': content,
-                'status': 'publish',
-                'featured_media': media_id
-            }
-            post_res = requests.post(f"{site['url']}/wp-json/wp/v2/posts", auth=auth, json=post_data)
-            if post_res.status_code == 201:
-                post_link = post_res.json().get('link', 'Ссылка недоступна')
-                results.append(f"✅ {post_link}")
-            else:
-                results.append(f"❌ Ошибка публикации на {site['url']}: {post_res.status_code}")
-        except Exception as e:
-            results.append(f"⚠️ Исключение на {site['url']}: {str(e)}")
-    return results
+# === Публикации ===
+def publish_to_wordpress_site(site: WordPressSite, draft: NewsDraft) -> tuple[bool, str]:
+    try:
+        media_url = f"{site.url}/wp-json/wp/v2/media"
+        files = {"file": ("news.jpg", draft.photo_bytes, "image/jpeg")}
+        media_res = requests.post(media_url, auth=site.auth, files=files, timeout=30)
+        if media_res.status_code != 201:
+            return False, f"❌ {site.name}: ошибка загрузки фото ({media_res.status_code})"
+        media_id = media_res.json().get("id")
+        post_payload = {
+            "title": draft.title,
+            "excerpt": draft.excerpt,
+            "content": draft.content,
+            "status": "publish",
+            "featured_media": media_id,
+            "categories": [site.category_id],
+        }
+        posts_url = f"{site.url}/wp-json/wp/v2/posts"
+        post_res = requests.post(posts_url, auth=site.auth, json=post_payload, timeout=30)
+        if post_res.status_code == 201:
+            post_link = post_res.json().get("link", "Ссылка недоступна")
+            return True, f"✅ {site.name}: опубликовано ({post_link})"
+        return False, f"❌ {site.name}: ошибка публикации ({post_res.status_code})"
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Ошибка публикации на %s: %s", site.name, exc)
+        return False, f"⚠️ {site.name}: исключение {exc}"
+
+
+async def publish_to_telegram_channel(draft: NewsDraft, bot: Bot) -> tuple[bool, str]:
+    if not TELEGRAM_CHANNEL_ID:
+        return False, "Телеграм-канал не настроен."
+    caption = f"<b>{draft.title}</b>\n\n{draft.excerpt}".strip()
+    try:
+        await bot.send_photo(
+            chat_id=TELEGRAM_CHANNEL_ID,
+            photo=draft.photo_bytes,
+            caption=caption[:1024],
+            parse_mode="HTML",
+        )
+        if draft.content.strip():
+            await bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=draft.content)
+        return True, "✅ Telegram: публикация отправлена."
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Ошибка публикации в Telegram: %s", exc)
+        return False, f"⚠️ Telegram: {exc}"
 
 # === Хендлеры Telegram ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -88,38 +199,112 @@ async def content(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return PHOTO
 
 async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.photo:
+        await update.message.reply_text("Нужно прислать изображение как фото.")
+        return PHOTO
     photo_file = await update.message.photo[-1].get_file()
     photo_bytes = await photo_file.download_as_bytearray()
 
-    title = context.user_data['title']
-    excerpt = context.user_data['excerpt']
-    content = context.user_data['content']
+    context.user_data['draft'] = NewsDraft(
+        title=context.user_data['title'],
+        excerpt=context.user_data['excerpt'],
+        content=context.user_data['content'],
+        photo_bytes=bytes(photo_bytes),
+    )
+    context.user_data['selected_targets'] = set()
+    await send_target_selection(update, context)
+    return TARGETS
 
-    sites = []
-    for i in range(1, 4):
-        url = os.getenv(f"WP_SITE_{i}_URL")
-        user = os.getenv(f"WP_SITE_{i}_USER")
-        pwd = os.getenv(f"WP_SITE_{i}_PASS")
-        if url and user and pwd:
-            sites.append({'url': url, 'auth': (user, pwd)})
 
-    if not sites:
-        await update.message.reply_text("⚠️ Не настроены WordPress-сайты.")
-        return ConversationHandler.END
+async def send_target_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    selected: Set[str] = context.user_data.get('selected_targets', set())
+    markup = build_targets_markup(selected)
+    await update.message.reply_text(
+        "Выберите площадки для публикации (можно несколько).",
+        reply_markup=markup,
+    )
 
-    await update.message.reply_text("📤 Публикую...")
 
-    try:
-        results = publish_to_wordpress(title, excerpt, content, bytes(photo_bytes), sites)
-        for res in results:
-            await update.message.reply_text(res)
-    except Exception as e:
-        logger.error(f"Ошибка: {e}")
-        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+def build_targets_markup(selected: Set[str]) -> InlineKeyboardMarkup:
+    rows = []
+    for target in PUBLICATION_TARGETS:
+        prefix = "✅" if target.target_id in selected else "⬜️"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{prefix} {target.label}",
+                    callback_data=f"toggle:{target.target_id}",
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton("Опубликовать", callback_data="publish:go"),
+            InlineKeyboardButton("Отмена", callback_data="publish:cancel"),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+async def toggle_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    target_id = query.data.split(":", 1)[1]
+    selected: Set[str] = context.user_data.get('selected_targets', set())
+    if target_id in selected:
+        selected.remove(target_id)
+    else:
+        if target_id not in TARGETS_BY_ID:
+            await query.answer("Неизвестная площадка.", show_alert=True)
+            return TARGETS
+        selected.add(target_id)
+    context.user_data['selected_targets'] = selected
+    await query.edit_message_reply_markup(reply_markup=build_targets_markup(selected))
+    return TARGETS
+
+
+async def publish_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    selected: Set[str] = context.user_data.get('selected_targets', set())
+    if not selected:
+        await query.answer("Выберите хотя бы одну площадку.", show_alert=True)
+        return TARGETS
+    draft: NewsDraft = context.user_data['draft']
+    await query.answer("Публикуем...")
+    await query.edit_message_text("Публикуем новость, подождите...")
+
+    results = []
+    for target_id in selected:
+        target = TARGETS_BY_ID.get(target_id)
+        if not target:
+            results.append(f"⚠️ Неизвестная площадка ({target_id}) пропущена.")
+            continue
+        if target.kind is TargetKind.WORDPRESS and target.site:
+            success, detail = await asyncio.to_thread(publish_to_wordpress_site, target.site, draft)
+        elif target.kind is TargetKind.TELEGRAM:
+            success, detail = await publish_to_telegram_channel(draft, context.bot)
+        else:
+            success = False
+            detail = f"⚠️ {target.label}: тип не поддерживается."
+        results.append(detail)
+
+    context.user_data.clear()
+    header = "Результаты публикации:"
+    await query.edit_message_text("\n".join([header, *results]), disable_web_page_preview=True)
     return ConversationHandler.END
+
+
+async def cancel_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Отменено.")
+    await query.edit_message_text("Публикация отменена.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🚫 Отменено.")
+    context.user_data.clear()
     return ConversationHandler.END
 
 # === Инициализация Telegram-приложения ===
@@ -130,7 +315,12 @@ def _build_conversation_handler() -> ConversationHandler:
             TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, title)],
             EXCERPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, excerpt)],
             CONTENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, content)],
-            PHOTO: [MessageHandler(filters.PHOTO, photo)]
+            PHOTO: [MessageHandler(filters.PHOTO, photo)],
+            TARGETS: [
+                CallbackQueryHandler(toggle_target, pattern=r"^toggle:"),
+                CallbackQueryHandler(publish_handler, pattern=r"^publish:go$"),
+                CallbackQueryHandler(cancel_selection, pattern=r"^publish:cancel$"),
+            ],
         },
         fallbacks=[CommandHandler('cancel', cancel)]
     )
