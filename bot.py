@@ -67,21 +67,6 @@ class NewsDraft:
     photo_bytes: bytes
     publish_at: datetime | None
 
-def publish_to_wordpress_site(site: WordPressSite, draft: NewsDraft) -> tuple[bool, str]:
-    try:
-        # Логирование перед запросом
-        logger.info(f"📤 Попытка публикации на {site.name}")
-        logger.info(f"🔗 URL: {site.url}")
-        logger.info(f" User: {site.auth[0]}")
-        
-        # Тестовый запрос
-        test_url = f"{site.url}/wp-json/wp/v2/users/me"
-        test_res = requests.get(test_url, auth=site.auth, timeout=10)
-        logger.info(f"🔍 Тест аутентификации: {test_res.status_code}")
-        if test_res.status_code != 200:
-            logger.error(f"❌ Ответ API: {test_res.text}")
-
-
 def load_wordpress_sites() -> List[WordPressSite]:
     sites: List[WordPressSite] = []
     for idx in range(1, 4):
