@@ -5,6 +5,7 @@ import asyncio
 import threading
 import concurrent.futures
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum, auto
@@ -35,7 +36,6 @@ logger = logging.getLogger(__name__)
 # === Состояния диалога ===
 TITLE, EXCERPT, CONTENT, SCHEDULE, PHOTO, TARGETS = range(6)
 
-
 # === Конфигурация публикаций ===
 TARGET_LABEL_OVERRIDES = {
     "wp:site1": 'Cайт АО "Эшелон Технологии"',
@@ -44,20 +44,17 @@ TARGET_LABEL_OVERRIDES = {
     "telegram:channel": 'Telegram-канал "Echelon Eyes"',
 }
 
-
 @dataclass(frozen=True)
 class WordPressSite:
     slug: str
     name: str
     url: str
-    auth: tuple[str, str]  # (login, password) - обычный пароль, не Application Password
+    auth: tuple[str, str]
     category_id: int
-
 
 class TargetKind(Enum):
     WORDPRESS = auto()
     TELEGRAM = auto()
-
 
 @dataclass(frozen=True)
 class PublicationTarget:
@@ -65,7 +62,6 @@ class PublicationTarget:
     label: str
     kind: TargetKind
     site: WordPressSite | None = None
-
 
 @dataclass
 class NewsDraft:
@@ -75,33 +71,36 @@ class NewsDraft:
     photo_bytes: bytes
     publish_at: datetime | None
 
-
-# === Cookie Authentication ===
-# Кэш сессий: slug -> (session, nonce, expires_at)
+# === Cookie Authentication с обходом базовых WAF ===
 _wp_sessions: Dict[str, tuple[requests.Session, str, datetime]] = {}
 
-
 def login_to_wordpress(site: WordPressSite) -> tuple[requests.Session, str]:
-    """
-    Логинится в WordPress через стандартную форму входа.
-    Возвращает (session, nonce).
-    """
     logger.info("🔐 Попытка входа в WordPress: %s (user: %s)", site.url, site.auth[0])
     
     session = requests.Session()
+    # Максимально реалистичные заголовки браузера для обхода WAF
     session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Referer': f'{site.url}/wp-login.php',
+        'DNT': '1',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'same-origin',
     })
     
-    # Шаг 1: Получаем начальную страницу логина (для cookies)
     login_url = f"{site.url}/wp-login.php"
     try:
-        initial_res = session.get(login_url, timeout=10)
+        # Небольшая задержка, чтобы не триггерить rate-limit
+        time.sleep(1.5)
+        initial_res = session.get(login_url, timeout=15)
         logger.debug("Получена страница логина, статус: %d", initial_res.status_code)
     except Exception as e:
-        raise RuntimeError(f"Не удалось получить страницу логина: {e}")
+        raise RuntimeError(f"Не удалось получить страницу логина (возможна блокировка WAF): {e}")
     
-    # Шаг 2: Отправляем форму логина
     login_data = {
         'log': site.auth[0],
         'pwd': site.auth[1],
@@ -111,111 +110,56 @@ def login_to_wordpress(site: WordPressSite) -> tuple[requests.Session, str]:
     }
     
     try:
-        login_res = session.post(
-            login_url,
-            data=login_data,
-            allow_redirects=True,
-            timeout=10
-        )
+        # Увеличиваем таймаут до 30 секунд на случай медленных проверок безопасности
+        login_res = session.post(login_url, data=login_data, allow_redirects=True, timeout=30)
         logger.debug("Ответ после логина, статус: %d, URL: %s", login_res.status_code, login_res.url)
+    except requests.exceptions.ReadTimeout:
+        raise RuntimeError("Сервер не ответил на запрос входа (таймаут). Вероятно, запрос заблокирован WAF (Cloudflare/Wordfence) на уровне сети.")
     except Exception as e:
         raise RuntimeError(f"Ошибка при отправке формы логина: {e}")
     
-    # Проверяем успешность логина
     if 'wp-admin' not in login_res.url and 'wp-login.php' in login_res.url:
-        raise RuntimeError(f"Логин не удался. Проверьте логин и пароль для {site.name}")
+        raise RuntimeError(f"Логин не удался. Проверьте логин и обычный пароль (не Application Password) для {site.name}")
     
-    # Проверяем наличие cookies авторизации
     has_auth_cookie = any('wordpress_logged_in' in cookie.name for cookie in session.cookies)
     if not has_auth_cookie:
-        raise RuntimeError(f"Не получены cookies авторизации для {site.name}")
+        raise RuntimeError(f"Не получены cookies авторизации для {site.name}. Возможно, включена 2FA или блокировка по IP.")
     
     logger.info("✅ Успешный вход в WordPress: %s", site.name)
-    
-    # Шаг 3: Получаем nonce через REST API
     nonce = get_nonce(session, site.url)
-    
     return session, nonce
 
-
 def get_nonce(session: requests.Session, site_url: str) -> str:
-    """
-    Получает REST API nonce через запрос к /wp-admin/admin-ajax.php
-    или через парсинг страницы админки.
-    """
-    # Метод 1: Через REST API endpoint (требует авторизации)
-    try:
-        nonce_url = f"{site_url}/wp-json/wp/v2/users/me"
-        nonce_res = session.get(nonce_url, timeout=10)
-        if nonce_res.status_code == 200:
-            # Nonce может быть в заголовках ответа
-            nonce = nonce_res.headers.get('X-WP-Nonce')
-            if nonce:
-                logger.info("✅ Nonce получен через REST API headers")
-                return nonce
-    except Exception as e:
-        logger.debug("Не удалось получить nonce через REST API: %s", e)
-    
-    # Метод 2: Парсим страницу админки
     try:
         admin_url = f"{site_url}/wp-admin/"
-        admin_res = session.get(admin_url, timeout=10)
+        time.sleep(1) # Задержка между запросами
+        admin_res = session.get(admin_url, timeout=15)
         if admin_res.status_code == 200:
-            # Ищем nonce в JavaScript переменных
             nonce_match = re.search(r'"nonce"\s*:\s*"([^"]+)"', admin_res.text)
             if nonce_match:
-                nonce = nonce_match.group(1)
-                logger.info("✅ Nonce получен через парсинг админки")
-                return nonce
-            
-            # Альтернативный паттерн
+                return nonce_match.group(1)
             nonce_match = re.search(r'wpApiSettings\s*=\s*\{.*?nonce\s*:\s*["\']([^"\']+)["\']', admin_res.text)
             if nonce_match:
-                nonce = nonce_match.group(1)
-                logger.info("✅ Nonce получен через wpApiSettings")
-                return nonce
+                return nonce_match.group(1)
     except Exception as e:
-        logger.debug("Не удалось получить nonce через парсинг: %s", e)
+        logger.debug("Не удалось получить nonce: %s", e)
     
-    # Метод 3: Через admin-ajax.php
-    try:
-        ajax_url = f"{site_url}/wp-admin/admin-ajax.php"
-        ajax_res = session.post(ajax_url, data={'action': 'heartbeat'}, timeout=10)
-        if ajax_res.status_code == 200:
-            nonce_match = re.search(r'"nonce"\s*:\s*"([^"]+)"', ajax_res.text)
-            if nonce_match:
-                nonce = nonce_match.group(1)
-                logger.info("✅ Nonce получен через admin-ajax.php")
-                return nonce
-    except Exception as e:
-        logger.debug("Не удалось получить nonce через admin-ajax: %s", e)
-    
-    raise RuntimeError("Не удалось получить nonce. WordPress может блокировать запросы.")
-
+    raise RuntimeError("Не удалось получить nonce. WordPress может блокировать доступ к админке.")
 
 def get_wp_session(site: WordPressSite) -> tuple[requests.Session, str]:
-    """
-    Получает сессию из кэша или создает новую.
-    Кэш живет 1 час.
-    """
     now = datetime.now()
-    
     if site.slug in _wp_sessions:
         session, nonce, expires_at = _wp_sessions[site.slug]
         if now < expires_at:
-            logger.debug("Используем кэшированную сессию для %s", site.name)
             return session, nonce
         else:
             logger.info("Сессия для %s истекла, создаем новую", site.name)
             del _wp_sessions[site.slug]
     
-    # Создаем новую сессию
     session, nonce = login_to_wordpress(site)
     expires_at = now + timedelta(hours=1)
     _wp_sessions[site.slug] = (session, nonce, expires_at)
-    
     return session, nonce
-
 
 def load_wordpress_sites() -> List[WordPressSite]:
     sites: List[WordPressSite] = []
@@ -238,12 +182,11 @@ def load_wordpress_sites() -> List[WordPressSite]:
                 slug=slug,
                 name=name,
                 url=url.rstrip("/"),
-                auth=(user, pwd),
+                auth=(user, pwd), # Здесь должен быть ОБЫЧНЫЙ пароль WordPress
                 category_id=category_id,
             )
         )
     return sites
-
 
 def build_targets(sites: List[WordPressSite], telegram_channel: str | None) -> List[PublicationTarget]:
     targets: List[PublicationTarget] = []
@@ -266,20 +209,14 @@ def build_targets(sites: List[WordPressSite], telegram_channel: str | None) -> L
             )
         )
     if not targets:
-        raise RuntimeError("Не заданы площадки для публикации. Заполните WP_SITE_* и/или TELEGRAM_TARGET_CHANNEL_ID.")
+        raise RuntimeError("Не заданы площадки для публикации.")
     return targets
-
 
 WORDPRESS_SITES = load_wordpress_sites()
 logger.info("🌐 Загружено WordPress сайтов: %d", len(WORDPRESS_SITES))
-for site in WORDPRESS_SITES:
-    logger.info("   - %s (slug: %s, url: %s, user: %s)", site.name, site.slug, site.url, site.auth[0])
-
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_TARGET_CHANNEL_ID")
 PUBLICATION_TARGETS = build_targets(WORDPRESS_SITES, TELEGRAM_CHANNEL_ID)
 TARGETS_BY_ID: Dict[str, PublicationTarget] = {target.target_id: target for target in PUBLICATION_TARGETS}
-logger.info(" Всего настроено целей для публикации: %d", len(PUBLICATION_TARGETS))
-
 
 def html_to_telegram(html_text: str) -> str:
     if not html_text:
@@ -289,72 +226,50 @@ def html_to_telegram(html_text: str) -> str:
     text = re.sub(r"<\s*br\s*/?>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<\s*/p\s*>", "\n\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<\s*p[^>]*>", "", text, flags=re.IGNORECASE)
-
     def replace_li(match: re.Match[str]) -> str:
-        inner = match.group(1).strip()
-        return f"• {inner}\n"
-
+        return f"• {match.group(1).strip()}\n"
     text = re.sub(r"<li[^>]*>(.*?)</li>", replace_li, text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r"</?(ul|ol)[^>]*>", "", text, flags=re.IGNORECASE)
     allowed = {"b", "i", "u", "a", "code", "pre"}
-
     def strip_tag(match: re.Match[str]) -> str:
-        raw = match.group(0)
         name = match.group(1).lower()
-        if name in allowed:
-            return raw
-        if name.startswith("/"):
-            name = name[1:]
-            if name in allowed:
-                return raw
+        if name in allowed or (name.startswith("/") and name[1:] in allowed):
+            return match.group(0)
         return ""
-
     text = re.sub(r"</?([a-zA-Z0-9]+)[^>]*>", strip_tag, text)
     text = unescape(text)
     text = re.sub(r"\n{3,}", "\n\n", text)
-    text = re.sub(r"[ \t]+\n", "\n", text)
     return text.strip()
 
-
-# === Глобальные переменные ===
 telegram_app = None
 telegram_loop: asyncio.AbstractEventLoop | None = None
 telegram_ready = threading.Event()
 _app_lock = threading.Lock()
 
-# === Публикации ===
 def publish_to_wordpress_site(site: WordPressSite, draft: NewsDraft) -> tuple[bool, str]:
     try:
-        logger.info("🚀 Начало публикации на сайт: %s (%s)", site.name, site.url)
-        
-        # Получаем авторизованную сессию и nonce
+        logger.info("🚀 Начало публикации на сайт: %s", site.name)
         try:
             session, nonce = get_wp_session(site)
         except Exception as auth_error:
-            logger.error("❌ Ошибка аутентификации: %s", auth_error, exc_info=True)
+            logger.error("❌ Ошибка аутентификации: %s", auth_error)
             return False, f"❌ {site.name}: ошибка входа ({auth_error})"
         
-        # Устанавливаем nonce в заголовки
-        session.headers.update({
-            'X-WP-Nonce': nonce,
-            'Referer': f'{site.url}/wp-admin/',
-        })
+        session.headers.update({'X-WP-Nonce': nonce, 'Referer': f'{site.url}/wp-admin/'})
         
-        # Шаг 1: Загрузка медиа
         media_url = f"{site.url}/wp-json/wp/v2/media"
         files = {"file": ("news.jpg", draft.photo_bytes, "image/jpeg")}
         
-        logger.info("📤 Загрузка медиа на %s", media_url)
+        logger.info("📤 Загрузка медиа...")
         media_res = session.post(media_url, files=files, timeout=30)
         
         if media_res.status_code != 201:
-            logger.error("❌ Ошибка загрузки медиа. Статус: %d, Ответ: %s", media_res.status_code, media_res.text[:500])
+            logger.error("❌ Ошибка загрузки медиа. Статус: %d, Ответ: %s", media_res.status_code, media_res.text[:300])
             return False, f"❌ {site.name}: ошибка загрузки фото ({media_res.status_code})"
             
         media_id = media_res.json().get("id")
         logger.info("✅ Медиа загружено, ID: %s", media_id)
         
-        # Шаг 2: Создание поста
         post_payload = {
             "title": draft.title,
             "excerpt": draft.excerpt,
@@ -367,24 +282,22 @@ def publish_to_wordpress_site(site: WordPressSite, draft: NewsDraft) -> tuple[bo
             post_payload["date"] = draft.publish_at.strftime("%Y-%m-%dT%H:%M:%S")
         
         posts_url = f"{site.url}/wp-json/wp/v2/posts"
-        logger.info("📤 Создание поста на %s", posts_url)
+        logger.info("📤 Создание поста...")
         post_res = session.post(posts_url, json=post_payload, timeout=30)
         
         if post_res.status_code == 201:
             post_link = post_res.json().get("link", "Ссылка недоступна")
-            logger.info("✅ Пост опубликован: %s", post_link)
             return True, f"✅ {site.name}: опубликовано ({post_link})"
         
-        logger.error("❌ Ошибка создания поста. Статус: %d, Ответ: %s", post_res.status_code, post_res.text[:500])
+        logger.error("❌ Ошибка создания поста. Статус: %d, Ответ: %s", post_res.status_code, post_res.text[:300])
         return False, f"❌ {site.name}: ошибка публикации ({post_res.status_code})"
         
     except requests.exceptions.RequestException as req_exc:
-        logger.error("⚠️ Сетевая ошибка: %s", req_exc, exc_info=True)
+        logger.error("⚠️ Сетевая ошибка: %s", req_exc)
         return False, f"⚠️ {site.name}: сетевая ошибка {req_exc}"
     except Exception as exc:
         logger.exception("️ Неожиданная ошибка: %s", exc)
         return False, f"️ {site.name}: исключение {exc}"
-
 
 async def publish_to_telegram_channel(draft: NewsDraft, bot: Bot) -> tuple[bool, str]:
     if not TELEGRAM_CHANNEL_ID:
@@ -399,35 +312,27 @@ async def publish_to_telegram_channel(draft: NewsDraft, bot: Bot) -> tuple[bool,
     if len(caption) > 1024:
         caption = caption[:1019].rstrip() + "…"
     try:
-        logger.info("📤 Отправка публикации в Telegram-канал: %s", TELEGRAM_CHANNEL_ID)
         await bot.send_photo(
             chat_id=TELEGRAM_CHANNEL_ID,
             photo=draft.photo_bytes,
             caption=caption[:1024],
             parse_mode=ParseMode.HTML,
         )
-        logger.info("✅ Публикация в Telegram успешна")
         return True, "✅ Telegram: публикация отправлена."
     except Exception as exc:
         logger.exception("Ошибка публикации в Telegram: %s", exc)
         return False, f"️ Telegram: {exc}"
 
-# === Хендлеры Telegram ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     allowed_ids_str = os.getenv("ALLOWED_USER_IDS", "")
-    
     try:
         allowed_ids = [int(x.strip()) for x in allowed_ids_str.split(",") if x.strip()]
     except ValueError:
         allowed_ids = []
-
     if user_id not in allowed_ids:
-        logger.warning("Попытка доступа запрещенного пользователя: %s", user_id)
         await update.message.reply_text("❌ У вас нет доступа к этому боту.")
         return ConversationHandler.END
-
-    logger.info("Начат новый диалог публикации с пользователем: %s", user_id)
     await update.message.reply_text("📰 Отправьте заголовок новости:")
     return TITLE
 
@@ -443,15 +348,12 @@ async def excerpt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def content(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['content'] = update.message.text
-    await update.message.reply_text(
-        "🗓 Укажите дату публикации для WordPress сайтов в формате HH:MM DD.MM.YYYY или напишите «Сейчас»."
-    )
+    await update.message.reply_text("🗓 Укажите дату публикации (HH:MM DD.MM.YYYY) или «Сейчас».")
     return SCHEDULE
-
 
 async def schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
-    if not text or text.lower() in {"сейчас", "now", "сейчас", "now"}:
+    if not text or text.lower() in {"сейчас", "now"}:
         context.user_data['publish_at'] = None
     else:
         try:
@@ -460,7 +362,7 @@ async def schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text("Не получилось распознать дату. Используйте формат HH:MM DD.MM.YYYY.")
             return SCHEDULE
-    await update.message.reply_text("🖼 Отправьте изображение (как фото, не как файл!):")
+    await update.message.reply_text("🖼 Отправьте изображение (как фото):")
     return PHOTO
 
 async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -469,7 +371,6 @@ async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return PHOTO
     photo_file = await update.message.photo[-1].get_file()
     photo_bytes = await photo_file.download_as_bytearray()
-
     context.user_data['draft'] = NewsDraft(
         title=context.user_data['title'],
         excerpt=context.user_data['excerpt'],
@@ -481,37 +382,20 @@ async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_target_selection(update, context)
     return TARGETS
 
-
 async def send_target_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
     selected: Set[str] = context.user_data.get('selected_targets', set())
-    markup = build_targets_markup(selected)
-    await message.reply_text(
-        "Выберите площадки для публикации (можно несколько).",
-        reply_markup=markup,
-    )
-
+    await update.effective_message.reply_text("Выберите площадки:", reply_markup=build_targets_markup(selected))
 
 def build_targets_markup(selected: Set[str]) -> InlineKeyboardMarkup:
     rows = []
     for target in PUBLICATION_TARGETS:
         prefix = "✅" if target.target_id in selected else "⬜️"
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"{prefix} {target.label}",
-                    callback_data=f"toggle:{target.target_id}",
-                )
-            ]
-        )
-    rows.append(
-        [
-            InlineKeyboardButton("Опубликовать", callback_data="publish:go"),
-            InlineKeyboardButton("Отмена", callback_data="publish:cancel"),
-        ]
-    )
+        rows.append([InlineKeyboardButton(f"{prefix} {target.label}", callback_data=f"toggle:{target.target_id}")])
+    rows.append([
+        InlineKeyboardButton("Опубликовать", callback_data="publish:go"),
+        InlineKeyboardButton("Отмена", callback_data="publish:cancel"),
+    ])
     return InlineKeyboardMarkup(rows)
-
 
 async def toggle_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -521,14 +405,10 @@ async def toggle_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target_id in selected:
         selected.remove(target_id)
     else:
-        if target_id not in TARGETS_BY_ID:
-            await query.answer("Неизвестная площадка.", show_alert=True)
-            return TARGETS
         selected.add(target_id)
     context.user_data['selected_targets'] = selected
     await query.edit_message_reply_markup(reply_markup=build_targets_markup(selected))
     return TARGETS
-
 
 async def publish_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -544,22 +424,19 @@ async def publish_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for target_id in selected:
         target = TARGETS_BY_ID.get(target_id)
         if not target:
-            results.append(f"⚠️ Неизвестная площадка ({target_id}) пропущена.")
+            results.append(f"⚠️ Неизвестная площадка ({target_id})")
             continue
         if target.kind is TargetKind.WORDPRESS and target.site:
             success, detail = await asyncio.to_thread(publish_to_wordpress_site, target.site, draft)
         elif target.kind is TargetKind.TELEGRAM:
             success, detail = await publish_to_telegram_channel(draft, context.bot)
         else:
-            success = False
-            detail = f"⚠️ {target.label}: тип не поддерживается."
+            success, detail = False, f"⚠️ {target.label}: тип не поддерживается."
         results.append(detail)
 
     context.user_data.clear()
-    header = "Результаты публикации:"
-    await query.edit_message_text("\n".join([header, *results]), disable_web_page_preview=True)
+    await query.edit_message_text("Результаты:\n" + "\n".join(results), disable_web_page_preview=True)
     return ConversationHandler.END
-
 
 async def cancel_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -568,13 +445,11 @@ async def cancel_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     return ConversationHandler.END
 
-
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🚫 Отменено.")
     context.user_data.clear()
     return ConversationHandler.END
 
-# === Инициализация Telegram-приложения ===
 def _build_conversation_handler() -> ConversationHandler:
     return ConversationHandler(
         entry_points=[CommandHandler('start', start)],
@@ -592,7 +467,6 @@ def _build_conversation_handler() -> ConversationHandler:
         },
         fallbacks=[CommandHandler('cancel', cancel)]
     )
-
 
 def _application_thread() -> None:
     global telegram_app, telegram_loop
@@ -613,7 +487,7 @@ def _application_thread() -> None:
     telegram_app = application
     telegram_loop = loop
     telegram_ready.set()
-    logger.info("✅ Telegram приложение успешно инициализировано в отдельном потоке")
+    logger.info("✅ Telegram приложение инициализировано")
 
     try:
         loop.run_forever()
@@ -623,7 +497,6 @@ def _application_thread() -> None:
             await application.shutdown()
         loop.run_until_complete(_shutdown())
         loop.close()
-
 
 def get_telegram_app():
     if telegram_app is None:
@@ -635,19 +508,17 @@ def get_telegram_app():
             raise RuntimeError("Не удалось инициализировать Telegram application.")
     return telegram_app
 
-
 def _process_update(update: Update) -> None:
     app_instance = get_telegram_app()
     if telegram_loop is None:
-        raise RuntimeError("Event loop Telegram приложения ещё не готов.")
+        raise RuntimeError("Event loop не готов.")
     future = asyncio.run_coroutine_threadsafe(app_instance.process_update(update), telegram_loop)
     try:
         future.result(timeout=30)
     except concurrent.futures.TimeoutError:
         future.cancel()
-        raise TimeoutError("Превышено время обработки апдейта Telegram.")
+        raise TimeoutError("Превышено время обработки апдейта.")
 
-# === Flask-приложение ===
 app = Flask(__name__)
 
 @app.route("/health")
@@ -657,7 +528,6 @@ def health():
 @app.route("/webhook/<token>", methods=["POST"])
 def webhook(token):
     if token != os.getenv("TELEGRAM_BOT_TOKEN"):
-        logger.warning("Попытка доступа к webhook с неверным токеном")
         return "Forbidden", 403
     try:
         app_instance = get_telegram_app()
@@ -668,7 +538,6 @@ def webhook(token):
         logger.error(f"Webhook error: {e}", exc_info=True)
         return "Error", 500
 
-# === Установка webhook при старте (вызывается вручную) ===
 def set_webhook_if_needed():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     render_url = os.getenv("RENDER_EXTERNAL_URL")
@@ -684,10 +553,9 @@ def set_webhook_if_needed():
         except Exception as e:
             logger.error(f"❌ Ошибка установки webhook: {e}", exc_info=True)
 
-# Запуск установки webhook при импорте (в безопасном потоке)
 threading.Thread(target=set_webhook_if_needed, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 10000))
-    logger.info(f" Запуск Flask-приложения на порту {port}")
+    logger.info(f"🚀 Запуск Flask на порту {port}")
     app.run(host="0.0.0.0", port=port)
