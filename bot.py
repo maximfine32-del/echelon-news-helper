@@ -25,6 +25,13 @@ from telegram.ext import (
 import requests
 from flask import Flask, request, jsonify
 
+# === Логирование ===
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
 # === Состояния диалога ===
 TITLE, EXCERPT, CONTENT, SCHEDULE, PHOTO, TARGETS = range(6)
 
@@ -36,6 +43,7 @@ TARGET_LABEL_OVERRIDES = {
     "wp:site3": 'Партнерский портал',
     "telegram:channel": 'Telegram-канал "Echelon Eyes"',
 }
+
 
 @dataclass(frozen=True)
 class WordPressSite:
@@ -66,6 +74,7 @@ class NewsDraft:
     content: str
     photo_bytes: bytes
     publish_at: datetime | None
+
 
 def load_wordpress_sites() -> List[WordPressSite]:
     sites: List[WordPressSite] = []
@@ -121,9 +130,14 @@ def build_targets(sites: List[WordPressSite], telegram_channel: str | None) -> L
 
 
 WORDPRESS_SITES = load_wordpress_sites()
+logger.info("🌐 Загружено WordPress сайтов: %d", len(WORDPRESS_SITES))
+for site in WORDPRESS_SITES:
+    logger.info("   - %s (slug: %s, url: %s, user: %s)", site.name, site.slug, site.url, site.auth[0])
+
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_TARGET_CHANNEL_ID")
 PUBLICATION_TARGETS = build_targets(WORDPRESS_SITES, TELEGRAM_CHANNEL_ID)
 TARGETS_BY_ID: Dict[str, PublicationTarget] = {target.target_id: target for target in PUBLICATION_TARGETS}
+logger.info("🎯 Всего настроено целей для публикации: %d", len(PUBLICATION_TARGETS))
 
 
 def html_to_telegram(html_text: str) -> str:
@@ -170,12 +184,22 @@ _app_lock = threading.Lock()
 # === Публикации ===
 def publish_to_wordpress_site(site: WordPressSite, draft: NewsDraft) -> tuple[bool, str]:
     try:
+        logger.info("🚀 Начало публикации на сайт: %s (%s)", site.name, site.url)
+        logger.info("👤 Логин для API: %s", site.auth[0])
+        
         media_url = f"{site.url}/wp-json/wp/v2/media"
         files = {"file": ("news.jpg", draft.photo_bytes, "image/jpeg")}
+        
+        logger.info("📤 Отправка запроса на загрузку медиа: %s", media_url)
         media_res = requests.post(media_url, auth=site.auth, files=files, timeout=30)
+        
         if media_res.status_code != 201:
-            return False, f"❌ {site.name}: ошибка загрузки фото ({media_res.status_code})"
+            logger.error("❌ Ошибка загрузки медиа. Статус: %d, Ответ сервера: %s", media_res.status_code, media_res.text[:500])
+            return False, f"❌ {site.name}: ошибка загрузки фото ({media_res.status_code}). Детали: {media_res.text[:200]}"
+            
         media_id = media_res.json().get("id")
+        logger.info("✅ Медиа успешно загружено, получен ID: %s", media_id)
+        
         post_payload = {
             "title": draft.title,
             "excerpt": draft.excerpt,
@@ -186,14 +210,24 @@ def publish_to_wordpress_site(site: WordPressSite, draft: NewsDraft) -> tuple[bo
         }
         if draft.publish_at:
             post_payload["date"] = draft.publish_at.strftime("%Y-%m-%dT%H:%M:%S")
+            
         posts_url = f"{site.url}/wp-json/wp/v2/posts"
+        logger.info("📤 Отправка запроса на создание поста: %s", posts_url)
         post_res = requests.post(posts_url, auth=site.auth, json=post_payload, timeout=30)
+        
         if post_res.status_code == 201:
             post_link = post_res.json().get("link", "Ссылка недоступна")
+            logger.info("✅ Пост успешно создан: %s", post_link)
             return True, f"✅ {site.name}: опубликовано ({post_link})"
-        return False, f"❌ {site.name}: ошибка публикации ({post_res.status_code})"
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Ошибка публикации на %s: %s", site.name, exc)
+            
+        logger.error("❌ Ошибка создания поста. Статус: %d, Ответ сервера: %s", post_res.status_code, post_res.text[:500])
+        return False, f"❌ {site.name}: ошибка публикации ({post_res.status_code}). Детали: {post_res.text[:200]}"
+        
+    except requests.exceptions.RequestException as req_exc:
+        logger.error("⚠️ Сетевая ошибка при публикации на %s: %s", site.name, req_exc, exc_info=True)
+        return False, f"⚠️ {site.name}: сетевая ошибка {req_exc}"
+    except Exception as exc:
+        logger.exception("⚠️ Неожиданная ошибка при публикации на %s: %s", site.name, exc)
         return False, f"⚠️ {site.name}: исключение {exc}"
 
 
@@ -210,14 +244,16 @@ async def publish_to_telegram_channel(draft: NewsDraft, bot: Bot) -> tuple[bool,
     if len(caption) > 1024:
         caption = caption[:1019].rstrip() + "…"
     try:
+        logger.info("📤 Отправка публикации в Telegram-канал: %s", TELEGRAM_CHANNEL_ID)
         await bot.send_photo(
             chat_id=TELEGRAM_CHANNEL_ID,
             photo=draft.photo_bytes,
             caption=caption[:1024],
             parse_mode=ParseMode.HTML,
         )
+        logger.info("✅ Публикация в Telegram успешна")
         return True, "✅ Telegram: публикация отправлена."
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.exception("Ошибка публикации в Telegram: %s", exc)
         return False, f"⚠️ Telegram: {exc}"
 
@@ -226,16 +262,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     allowed_ids_str = os.getenv("ALLOWED_USER_IDS", "")
     
-    # Преобразуем строку в список целых чисел
     try:
         allowed_ids = [int(x.strip()) for x in allowed_ids_str.split(",") if x.strip()]
     except ValueError:
         allowed_ids = []
 
     if user_id not in allowed_ids:
+        logger.warning("Попытка доступа запрещенного пользователя: %s", user_id)
         await update.message.reply_text("❌ У вас нет доступа к этому боту.")
         return ConversationHandler.END
 
+    logger.info("Начат новый диалог публикации с пользователем: %s", user_id)
     await update.message.reply_text("📰 Отправьте заголовок новости:")
     return TITLE
 
@@ -259,7 +296,7 @@ async def content(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
-    if not text or text.lower() in {"сейчас", "now", "Сейчас", "Now"}:
+    if not text or text.lower() in {"сейчас", "now", "сейчас", "now"}:
         context.user_data['publish_at'] = None
     else:
         try:
@@ -403,10 +440,6 @@ def _build_conversation_handler() -> ConversationHandler:
 
 
 def _application_thread() -> None:
-    """
-    Создаёт приложение Telegram в отдельном event loop и держит его активным.
-    Flask-запросы затем прокидывают апдейты в этот loop через run_coroutine_threadsafe.
-    """
     global telegram_app, telegram_loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -425,6 +458,7 @@ def _application_thread() -> None:
     telegram_app = application
     telegram_loop = loop
     telegram_ready.set()
+    logger.info("✅ Telegram приложение успешно инициализировано в отдельном потоке")
 
     try:
         loop.run_forever()
@@ -468,6 +502,7 @@ def health():
 @app.route("/webhook/<token>", methods=["POST"])
 def webhook(token):
     if token != os.getenv("TELEGRAM_BOT_TOKEN"):
+        logger.warning("Попытка доступа к webhook с неверным токеном")
         return "Forbidden", 403
     try:
         app_instance = get_telegram_app()
@@ -475,7 +510,7 @@ def webhook(token):
         _process_update(update)
         return "OK", 200
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
+        logger.error(f"Webhook error: {e}", exc_info=True)
         return "Error", 500
 
 # === Установка webhook при старте (вызывается вручную) ===
@@ -490,13 +525,14 @@ def set_webhook_if_needed():
         bot = Bot(token=token)
         try:
             asyncio.run(bot.set_webhook(url=webhook_url))
-            logger.info(f"Webhook установлен: {webhook_url}")
+            logger.info(f"✅ Webhook установлен: {webhook_url}")
         except Exception as e:
-            logger.error(f"Ошибка установки webhook: {e}")
+            logger.error(f"❌ Ошибка установки webhook: {e}", exc_info=True)
 
 # Запуск установки webhook при импорте (в безопасном потоке)
 threading.Thread(target=set_webhook_if_needed, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 10000))
+    logger.info(f"🚀 Запуск Flask-приложения на порту {port}")
     app.run(host="0.0.0.0", port=port)
