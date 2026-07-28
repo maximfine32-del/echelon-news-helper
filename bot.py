@@ -6,10 +6,10 @@ import threading
 import concurrent.futures
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum, auto
 from html import unescape
-from typing import List, Dict, Set
+from typing import List, Dict, Set, Optional
 
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -50,7 +50,7 @@ class WordPressSite:
     slug: str
     name: str
     url: str
-    auth: tuple[str, str]
+    auth: tuple[str, str]  # (login, password) - обычный пароль, не Application Password
     category_id: int
 
 
@@ -74,6 +74,147 @@ class NewsDraft:
     content: str
     photo_bytes: bytes
     publish_at: datetime | None
+
+
+# === Cookie Authentication ===
+# Кэш сессий: slug -> (session, nonce, expires_at)
+_wp_sessions: Dict[str, tuple[requests.Session, str, datetime]] = {}
+
+
+def login_to_wordpress(site: WordPressSite) -> tuple[requests.Session, str]:
+    """
+    Логинится в WordPress через стандартную форму входа.
+    Возвращает (session, nonce).
+    """
+    logger.info("🔐 Попытка входа в WordPress: %s (user: %s)", site.url, site.auth[0])
+    
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    })
+    
+    # Шаг 1: Получаем начальную страницу логина (для cookies)
+    login_url = f"{site.url}/wp-login.php"
+    try:
+        initial_res = session.get(login_url, timeout=10)
+        logger.debug("Получена страница логина, статус: %d", initial_res.status_code)
+    except Exception as e:
+        raise RuntimeError(f"Не удалось получить страницу логина: {e}")
+    
+    # Шаг 2: Отправляем форму логина
+    login_data = {
+        'log': site.auth[0],
+        'pwd': site.auth[1],
+        'wp-submit': 'Войти',
+        'redirect_to': f'{site.url}/wp-admin/',
+        'testcookie': '1',
+    }
+    
+    try:
+        login_res = session.post(
+            login_url,
+            data=login_data,
+            allow_redirects=True,
+            timeout=10
+        )
+        logger.debug("Ответ после логина, статус: %d, URL: %s", login_res.status_code, login_res.url)
+    except Exception as e:
+        raise RuntimeError(f"Ошибка при отправке формы логина: {e}")
+    
+    # Проверяем успешность логина
+    if 'wp-admin' not in login_res.url and 'wp-login.php' in login_res.url:
+        raise RuntimeError(f"Логин не удался. Проверьте логин и пароль для {site.name}")
+    
+    # Проверяем наличие cookies авторизации
+    has_auth_cookie = any('wordpress_logged_in' in cookie.name for cookie in session.cookies)
+    if not has_auth_cookie:
+        raise RuntimeError(f"Не получены cookies авторизации для {site.name}")
+    
+    logger.info("✅ Успешный вход в WordPress: %s", site.name)
+    
+    # Шаг 3: Получаем nonce через REST API
+    nonce = get_nonce(session, site.url)
+    
+    return session, nonce
+
+
+def get_nonce(session: requests.Session, site_url: str) -> str:
+    """
+    Получает REST API nonce через запрос к /wp-admin/admin-ajax.php
+    или через парсинг страницы админки.
+    """
+    # Метод 1: Через REST API endpoint (требует авторизации)
+    try:
+        nonce_url = f"{site_url}/wp-json/wp/v2/users/me"
+        nonce_res = session.get(nonce_url, timeout=10)
+        if nonce_res.status_code == 200:
+            # Nonce может быть в заголовках ответа
+            nonce = nonce_res.headers.get('X-WP-Nonce')
+            if nonce:
+                logger.info("✅ Nonce получен через REST API headers")
+                return nonce
+    except Exception as e:
+        logger.debug("Не удалось получить nonce через REST API: %s", e)
+    
+    # Метод 2: Парсим страницу админки
+    try:
+        admin_url = f"{site_url}/wp-admin/"
+        admin_res = session.get(admin_url, timeout=10)
+        if admin_res.status_code == 200:
+            # Ищем nonce в JavaScript переменных
+            nonce_match = re.search(r'"nonce"\s*:\s*"([^"]+)"', admin_res.text)
+            if nonce_match:
+                nonce = nonce_match.group(1)
+                logger.info("✅ Nonce получен через парсинг админки")
+                return nonce
+            
+            # Альтернативный паттерн
+            nonce_match = re.search(r'wpApiSettings\s*=\s*\{.*?nonce\s*:\s*["\']([^"\']+)["\']', admin_res.text)
+            if nonce_match:
+                nonce = nonce_match.group(1)
+                logger.info("✅ Nonce получен через wpApiSettings")
+                return nonce
+    except Exception as e:
+        logger.debug("Не удалось получить nonce через парсинг: %s", e)
+    
+    # Метод 3: Через admin-ajax.php
+    try:
+        ajax_url = f"{site_url}/wp-admin/admin-ajax.php"
+        ajax_res = session.post(ajax_url, data={'action': 'heartbeat'}, timeout=10)
+        if ajax_res.status_code == 200:
+            nonce_match = re.search(r'"nonce"\s*:\s*"([^"]+)"', ajax_res.text)
+            if nonce_match:
+                nonce = nonce_match.group(1)
+                logger.info("✅ Nonce получен через admin-ajax.php")
+                return nonce
+    except Exception as e:
+        logger.debug("Не удалось получить nonce через admin-ajax: %s", e)
+    
+    raise RuntimeError("Не удалось получить nonce. WordPress может блокировать запросы.")
+
+
+def get_wp_session(site: WordPressSite) -> tuple[requests.Session, str]:
+    """
+    Получает сессию из кэша или создает новую.
+    Кэш живет 1 час.
+    """
+    now = datetime.now()
+    
+    if site.slug in _wp_sessions:
+        session, nonce, expires_at = _wp_sessions[site.slug]
+        if now < expires_at:
+            logger.debug("Используем кэшированную сессию для %s", site.name)
+            return session, nonce
+        else:
+            logger.info("Сессия для %s истекла, создаем новую", site.name)
+            del _wp_sessions[site.slug]
+    
+    # Создаем новую сессию
+    session, nonce = login_to_wordpress(site)
+    expires_at = now + timedelta(hours=1)
+    _wp_sessions[site.slug] = (session, nonce, expires_at)
+    
+    return session, nonce
 
 
 def load_wordpress_sites() -> List[WordPressSite]:
@@ -137,7 +278,7 @@ for site in WORDPRESS_SITES:
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_TARGET_CHANNEL_ID")
 PUBLICATION_TARGETS = build_targets(WORDPRESS_SITES, TELEGRAM_CHANNEL_ID)
 TARGETS_BY_ID: Dict[str, PublicationTarget] = {target.target_id: target for target in PUBLICATION_TARGETS}
-logger.info("🎯 Всего настроено целей для публикации: %d", len(PUBLICATION_TARGETS))
+logger.info(" Всего настроено целей для публикации: %d", len(PUBLICATION_TARGETS))
 
 
 def html_to_telegram(html_text: str) -> str:
@@ -185,21 +326,35 @@ _app_lock = threading.Lock()
 def publish_to_wordpress_site(site: WordPressSite, draft: NewsDraft) -> tuple[bool, str]:
     try:
         logger.info("🚀 Начало публикации на сайт: %s (%s)", site.name, site.url)
-        logger.info("👤 Логин для API: %s", site.auth[0])
         
+        # Получаем авторизованную сессию и nonce
+        try:
+            session, nonce = get_wp_session(site)
+        except Exception as auth_error:
+            logger.error("❌ Ошибка аутентификации: %s", auth_error, exc_info=True)
+            return False, f"❌ {site.name}: ошибка входа ({auth_error})"
+        
+        # Устанавливаем nonce в заголовки
+        session.headers.update({
+            'X-WP-Nonce': nonce,
+            'Referer': f'{site.url}/wp-admin/',
+        })
+        
+        # Шаг 1: Загрузка медиа
         media_url = f"{site.url}/wp-json/wp/v2/media"
         files = {"file": ("news.jpg", draft.photo_bytes, "image/jpeg")}
         
-        logger.info("📤 Отправка запроса на загрузку медиа: %s", media_url)
-        media_res = requests.post(media_url, auth=site.auth, files=files, timeout=30)
+        logger.info("📤 Загрузка медиа на %s", media_url)
+        media_res = session.post(media_url, files=files, timeout=30)
         
         if media_res.status_code != 201:
-            logger.error("❌ Ошибка загрузки медиа. Статус: %d, Ответ сервера: %s", media_res.status_code, media_res.text[:500])
-            return False, f"❌ {site.name}: ошибка загрузки фото ({media_res.status_code}). Детали: {media_res.text[:200]}"
+            logger.error("❌ Ошибка загрузки медиа. Статус: %d, Ответ: %s", media_res.status_code, media_res.text[:500])
+            return False, f"❌ {site.name}: ошибка загрузки фото ({media_res.status_code})"
             
         media_id = media_res.json().get("id")
-        logger.info("✅ Медиа успешно загружено, получен ID: %s", media_id)
+        logger.info("✅ Медиа загружено, ID: %s", media_id)
         
+        # Шаг 2: Создание поста
         post_payload = {
             "title": draft.title,
             "excerpt": draft.excerpt,
@@ -210,25 +365,25 @@ def publish_to_wordpress_site(site: WordPressSite, draft: NewsDraft) -> tuple[bo
         }
         if draft.publish_at:
             post_payload["date"] = draft.publish_at.strftime("%Y-%m-%dT%H:%M:%S")
-            
+        
         posts_url = f"{site.url}/wp-json/wp/v2/posts"
-        logger.info("📤 Отправка запроса на создание поста: %s", posts_url)
-        post_res = requests.post(posts_url, auth=site.auth, json=post_payload, timeout=30)
+        logger.info("📤 Создание поста на %s", posts_url)
+        post_res = session.post(posts_url, json=post_payload, timeout=30)
         
         if post_res.status_code == 201:
             post_link = post_res.json().get("link", "Ссылка недоступна")
-            logger.info("✅ Пост успешно создан: %s", post_link)
+            logger.info("✅ Пост опубликован: %s", post_link)
             return True, f"✅ {site.name}: опубликовано ({post_link})"
-            
-        logger.error("❌ Ошибка создания поста. Статус: %d, Ответ сервера: %s", post_res.status_code, post_res.text[:500])
-        return False, f"❌ {site.name}: ошибка публикации ({post_res.status_code}). Детали: {post_res.text[:200]}"
+        
+        logger.error("❌ Ошибка создания поста. Статус: %d, Ответ: %s", post_res.status_code, post_res.text[:500])
+        return False, f"❌ {site.name}: ошибка публикации ({post_res.status_code})"
         
     except requests.exceptions.RequestException as req_exc:
-        logger.error("⚠️ Сетевая ошибка при публикации на %s: %s", site.name, req_exc, exc_info=True)
+        logger.error("⚠️ Сетевая ошибка: %s", req_exc, exc_info=True)
         return False, f"⚠️ {site.name}: сетевая ошибка {req_exc}"
     except Exception as exc:
-        logger.exception("⚠️ Неожиданная ошибка при публикации на %s: %s", site.name, exc)
-        return False, f"⚠️ {site.name}: исключение {exc}"
+        logger.exception("️ Неожиданная ошибка: %s", exc)
+        return False, f"️ {site.name}: исключение {exc}"
 
 
 async def publish_to_telegram_channel(draft: NewsDraft, bot: Bot) -> tuple[bool, str]:
@@ -255,7 +410,7 @@ async def publish_to_telegram_channel(draft: NewsDraft, bot: Bot) -> tuple[bool,
         return True, "✅ Telegram: публикация отправлена."
     except Exception as exc:
         logger.exception("Ошибка публикации в Telegram: %s", exc)
-        return False, f"⚠️ Telegram: {exc}"
+        return False, f"️ Telegram: {exc}"
 
 # === Хендлеры Telegram ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -534,5 +689,5 @@ threading.Thread(target=set_webhook_if_needed, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 10000))
-    logger.info(f"🚀 Запуск Flask-приложения на порту {port}")
+    logger.info(f" Запуск Flask-приложения на порту {port}")
     app.run(host="0.0.0.0", port=port)
