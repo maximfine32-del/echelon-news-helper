@@ -40,6 +40,7 @@ TITLE, EXCERPT, CONTENT, SCHEDULE, PHOTO, TARGETS = range(6)
 TARGET_LABEL_OVERRIDES = {
     "wp:site1": 'Cайт АО "Эшелон Технологии"',
     "wp:site2": 'Сайт АО "НПО "Эшелон"',
+    "wp:site3": 'Партнерский портал',
     "telegram:channel": 'Telegram-канал "Echelon Eyes"',
 }
 
